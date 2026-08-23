@@ -88,6 +88,25 @@ class CaptchaRecognitionTest(unittest.TestCase):
         ):
             self.assertEqual(recognize_captcha(b"image"), "77D2A8")
 
+    def test_low_confidence_non_od_conflict_keeps_primary_result(self):
+        """低置信度候选若不是已确认的 O/D 混淆，仍保留基线结果。"""
+
+        with (
+            patch(
+                "main.build_image_candidates",
+                return_value=[b"primary", b"fallback-1", b"fallback-2"],
+            ),
+            patch(
+                "main.classify_candidate",
+                side_effect=(
+                    ("49DEDG", 0.8),
+                    ("49DEDC", 0.95),
+                    ("49DEDC", 0.9),
+                ),
+            ),
+        ):
+            self.assertEqual(recognize_captcha(b"image"), "49DEDG")
+
     def test_transparent_image_is_composited_on_white(self):
         """透明图片必须先铺白底，避免透明像素被误当成黑色字符。"""
 

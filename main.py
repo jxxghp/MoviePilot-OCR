@@ -18,6 +18,7 @@ DARK_PIXEL_THRESHOLD = 64
 MIN_COMPONENT_AREA = 3
 BORDER_WIDTH = 2
 CAPTCHA_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
+PRIMARY_CONFIDENCE_THRESHOLD = 0.84
 
 app = FastAPI(title="MoviePilot OCR", version="2.0.0")
 
@@ -264,13 +265,37 @@ def recognize_captcha(image_bytes: bytes) -> str:
     candidates = build_image_candidates(image_bytes)
     predictions: list[tuple[str, float]] = []
     with ocr_lock:
-        for candidate in candidates:
+        primary, primary_confidence = classify_candidate(candidates[0])
+        if primary and primary_confidence >= PRIMARY_CONFIDENCE_THRESHOLD:
+            return primary
+        if primary:
+            predictions.append((primary, primary_confidence))
+
+        # 大多数验证码在旧预处理路径上已有较高置信度，只对低置信度或
+        # 格式异常结果执行额外推理，避免弱 CPU 主机的响应时间成倍增加。
+        for candidate in candidates[1:]:
             normalized, confidence = classify_candidate(candidate)
             if normalized:
                 predictions.append((normalized, confidence))
 
     if not predictions:
         return ""
+    if primary:
+        # HDSky 的红色遮罩会把首字符 D 误识别为 O；当去干扰候选只修正
+        # 这一位且其余字符完全一致时采用 D。其他冲突保留基线结果，避免
+        # 阈值候选把清晰的 2/ Z、G/ C 等字符改错。
+        corrected = next(
+            (
+                prediction
+                for prediction, _ in predictions
+                if prediction[1:] == primary[1:]
+                and primary[0] == "O"
+                and prediction[0] == "D"
+            ),
+            None,
+        )
+        return corrected or primary
+
     # 先按票数聚合，再用字符置信度打破冲突；置信度可以识别“旧路径只错
     # 一个字符、去线候选却恰好重复”的情况，同时仍保留旧路径的优先级。
     counts: dict[str, int] = {}
