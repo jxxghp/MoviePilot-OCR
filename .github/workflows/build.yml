@@ -41,6 +41,8 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ secrets.DOCKER_USERNAME }}/moviepilot-ocr:latest
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/moviepilot-ocr:latest
+            ${{ secrets.DOCKER_USERNAME }}/moviepilot-ocr:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -17,6 +17,7 @@ MAX_IMAGE_SIDE = 4096
 DARK_PIXEL_THRESHOLD = 64
 MIN_COMPONENT_AREA = 3
 BORDER_WIDTH = 2
+CAPTCHA_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
 
 app = FastAPI(title="MoviePilot OCR", version="2.0.0")
 
@@ -26,28 +27,40 @@ ocr_lock = Lock()
 
 
 class OCRRequest(BaseModel):
+    """验证码识别请求，包含纯 Base64 或 data URL 图片。"""
+
     base64_img: str
 
 
 class OCRResponse(BaseModel):
+    """验证码识别响应。"""
+
     result: str
 
 
 class ImageTooLargeError(ValueError):
+    """图片超过字节数或像素尺寸限制。"""
+
     pass
 
 
 class InvalidImageError(ValueError):
+    """请求内容不是可解码的有效图片。"""
+
     pass
 
 
 @app.get("/")
 def root():
+    """返回服务存活状态。"""
+
     return {"message": "MoviePilot OCR API"}
 
 
 @app.post("/captcha/base64", response_model=OCRResponse)
 def captcha_base64(data: OCRRequest):
+    """解码并识别 Base64 验证码图片。"""
+
     try:
         image_bytes = decode_base64_image(data.base64_img)
         result = recognize_captcha(image_bytes)
@@ -66,6 +79,8 @@ def captcha_base64(data: OCRRequest):
 
 
 def decode_base64_image(value: str) -> bytes:
+    """解码纯 Base64 或 data URL，并执行请求大小校验。"""
+
     payload = "".join((value or "").split())
     if payload.lower().startswith("data:image/"):
         metadata, separator, payload = payload.partition(",")
@@ -96,6 +111,12 @@ def decode_base64_image(value: str) -> bytes:
 
 
 def preprocess_captcha(image_bytes: bytes) -> bytes:
+    """
+    生成适合验证码模型识别的深色字符图
+
+    :param image_bytes: 原始验证码图片
+    :return: 处理后的 PNG 图片字节
+    """
     gray = load_grayscale_image(image_bytes)
     binary = np.where(gray <= DARK_PIXEL_THRESHOLD, 0, 255).astype(np.uint8)
 
@@ -121,7 +142,92 @@ def preprocess_captcha(image_bytes: bytes) -> bytes:
     return output.tobytes()
 
 
-def load_grayscale_image(image_bytes: bytes) -> np.ndarray:
+def build_image_candidates(image_bytes: bytes) -> list[bytes]:
+    """
+    为彩色遮罩、干扰线和噪点验证码生成多种识别输入
+
+    :param image_bytes: 原始验证码图片
+    :return: 去重后的候选 PNG 图片列表
+    """
+    gray = load_grayscale_image(image_bytes)
+    rgb = load_rgb_image(image_bytes)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    # 先保留原版本的预处理路径，确保已验证的站点样本不会因新增候选而回归。
+    candidates = [preprocess_captcha(image_bytes)]
+
+    # 彩色遮罩会把字符笔画与背景连成一块；仅在检测到明显彩色像素时启用
+    # 颜色抑制候选，避免普通验证码每次额外执行模型推理。
+    color_mask = (hsv[:, :, 1] > 95) & (hsv[:, :, 2] < 245)
+    if float(np.mean(color_mask)) >= 0.01:
+        neutral_dark = np.where(
+            (hsv[:, :, 1] < 95) & (hsv[:, :, 2] < 210),
+            0,
+            255,
+        ).astype(np.uint8)
+        candidates.append(_encode_png(neutral_dark))
+
+    # 保留原图和一个较宽阈值候选，覆盖字符较浅或压缩较重的站点。
+    candidates.append(image_bytes)
+    candidates.append(_encode_png(np.where(gray <= 100, 0, 255).astype(np.uint8)))
+
+    # 在线条位于前景时提取并相减，再反色还原；直接对白底黑字做开运算
+    # 会把白色背景当成待移除对象，反而损坏验证码。
+    binary = np.where(gray <= DARK_PIXEL_THRESHOLD, 0, 255).astype(np.uint8)
+    foreground = 255 - binary
+    for width, height in ((9, 1), (1, 9)):
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (width, height))
+        lines = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel)
+        without_lines = cv2.subtract(foreground, lines)
+        candidates.append(_encode_png(255 - without_lines))
+
+    unique_candidates: list[bytes] = []
+    seen: set[bytes] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _encode_png(image: np.ndarray) -> bytes:
+    """将灰度矩阵编码为 PNG 字节。"""
+    encoded, output = cv2.imencode(".png", image)
+    if not encoded:
+        raise InvalidImageError("failed to encode candidate image")
+    return output.tobytes()
+
+
+def normalize_prediction(prediction: str) -> str:
+    """
+    规范化 OCR 输出并过滤模型返回的非验证码字符
+
+    :param prediction: OCR 模型原始结果
+    :return: 大写字母数字结果，不符合六位验证码格式时返回空字符串
+    """
+    result = "".join(re.findall(r"[A-Za-z0-9]", prediction or "")).upper()
+    return result if CAPTCHA_PATTERN.fullmatch(result) else ""
+
+
+def classify_candidate(image_bytes: bytes) -> tuple[str, float]:
+    """识别单个候选并返回归一化结果及非空字符置信度。"""
+    output = ocr.classification(image_bytes, probability=True)
+    charsets = output["charsets"]
+    probabilities = output["probability"]
+    raw_chars: list[str] = []
+    confidence: list[float] = []
+    last_index = 0
+    for row in probabilities:
+        index = max(range(len(row)), key=row.__getitem__)
+        if index != last_index and index != 0:
+            raw_chars.append(charsets[index])
+            confidence.append(float(row[index]))
+        last_index = index
+    normalized = normalize_prediction("".join(raw_chars))
+    return normalized, sum(confidence) / len(confidence) if confidence else 0.0
+
+
+def load_rgb_image(image_bytes: bytes) -> np.ndarray:
+    """校验图片尺寸并转换为不含透明通道的 RGB 矩阵。"""
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
             width, height = image.size
@@ -134,7 +240,7 @@ def load_grayscale_image(image_bytes: bytes) -> np.ndarray:
                 rgba = image.convert("RGBA")
                 background = Image.new("RGBA", rgba.size, "white")
                 image = Image.alpha_composite(background, rgba).convert("RGB")
-            return np.asarray(image.convert("L"), dtype=np.uint8)
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
     except ImageTooLargeError:
         raise
     except InvalidImageError:
@@ -143,14 +249,41 @@ def load_grayscale_image(image_bytes: bytes) -> np.ndarray:
         raise InvalidImageError("decoded content is not a supported image") from exc
 
 
-def recognize_captcha(image_bytes: bytes) -> str:
-    processed = preprocess_captcha(image_bytes)
-    with ocr_lock:
-        prediction = ocr.classification(processed)
+def load_grayscale_image(image_bytes: bytes) -> np.ndarray:
+    """校验图片并转换为灰度矩阵，统一处理透明背景。"""
+    return cv2.cvtColor(load_rgb_image(image_bytes), cv2.COLOR_RGB2GRAY)
 
-    # These captchas use uppercase ASCII letters and digits. Normalizing the
-    # model output also resolves visually identical upper/lowercase glyphs.
-    return "".join(re.findall(r"[A-Za-z0-9]", prediction)).upper()
+
+def recognize_captcha(image_bytes: bytes) -> str:
+    """
+    使用多候选结果投票识别六位字母数字验证码
+
+    :param image_bytes: 原始验证码图片
+    :return: 验证码识别结果，无法确认时返回空字符串
+    """
+    candidates = build_image_candidates(image_bytes)
+    predictions: list[tuple[str, float]] = []
+    with ocr_lock:
+        for candidate in candidates:
+            normalized, confidence = classify_candidate(candidate)
+            if normalized:
+                predictions.append((normalized, confidence))
+
+    if not predictions:
+        return ""
+    # 先按票数聚合，再用字符置信度打破冲突；置信度可以识别“旧路径只错
+    # 一个字符、去线候选却恰好重复”的情况，同时仍保留旧路径的优先级。
+    counts: dict[str, int] = {}
+    confidence: dict[str, float] = {}
+    first_seen: dict[str, int] = {}
+    for index, (prediction, score) in enumerate(predictions):
+        counts[prediction] = counts.get(prediction, 0) + 1
+        confidence[prediction] = max(confidence.get(prediction, 0.0), score)
+        first_seen.setdefault(prediction, index)
+    return max(
+        counts,
+        key=lambda value: (counts[value], confidence[value], -first_seen[value]),
+    )
 
 
 if __name__ == "__main__":

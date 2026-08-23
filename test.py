@@ -1,6 +1,18 @@
+import io
 import unittest
+from unittest.mock import patch
 
-from main import InvalidImageError, decode_base64_image, recognize_captcha
+from PIL import Image
+
+import main
+from main import (
+    ImageTooLargeError,
+    InvalidImageError,
+    decode_base64_image,
+    load_grayscale_image,
+    normalize_prediction,
+    recognize_captcha,
+)
 
 
 a = {
@@ -12,7 +24,11 @@ b = {"base64_img": image_b64}
 
 
 class CaptchaRecognitionTest(unittest.TestCase):
+    """覆盖验证码识别回归、输入校验和候选选择策略。"""
+
     def test_repository_samples(self):
+        """仓库内已标注样本必须保持原有正确结果。"""
+
         samples = (
             (a["base64_img"], "77D2A8"),
             (b["base64_img"], "3BME4D"),
@@ -24,13 +40,80 @@ class CaptchaRecognitionTest(unittest.TestCase):
                 self.assertEqual(recognize_captcha(image_bytes), expected)
 
     def test_data_url_and_missing_padding_are_accepted(self):
+        """兼容 data URL 和省略 Base64 尾部填充的调用方。"""
+
         encoded = a["base64_img"].rstrip("=")
         image_bytes = decode_base64_image(f"data:image/png;base64,{encoded}")
         self.assertTrue(image_bytes.startswith(b"\x89PNG"))
 
     def test_invalid_base64_is_rejected(self):
+        """非法 Base64 必须作为客户端输入错误拒绝。"""
+
         with self.assertRaisesRegex(InvalidImageError, "not valid Base64"):
             decode_base64_image("not-base64")
+
+    def test_prediction_is_normalized_and_requires_six_characters(self):
+        """只接受六位 ASCII 字母数字，并统一转换为大写。"""
+
+        self.assertEqual(normalize_prediction("a1B2c3"), "A1B2C3")
+        self.assertEqual(normalize_prediction("a1-b2c3"), "A1B2C3")
+        self.assertEqual(normalize_prediction("ABCDE"), "")
+        self.assertEqual(normalize_prediction("中文123456"), "123456")
+
+    def test_candidate_voting_overrides_a_single_primary_mistake(self):
+        """多个候选一致时应纠正旧预处理路径的单次误判。"""
+
+        candidates = [b"primary", b"threshold", b"line-removed"]
+        with (
+            patch("main.build_image_candidates", return_value=candidates),
+            patch(
+                "main.classify_candidate",
+                side_effect=(("O9NNMR", 0.7), ("D9NNMR", 0.9), ("D9NNMR", 0.8)),
+            ),
+        ):
+            self.assertEqual(recognize_captcha(b"image"), "D9NNMR")
+
+    def test_candidate_tie_keeps_primary_result(self):
+        """候选票数相同时保留旧路径结果，防止已有站点回归。"""
+
+        with (
+            patch(
+                "main.build_image_candidates",
+                return_value=[b"primary", b"fallback"],
+            ),
+            patch(
+                "main.classify_candidate",
+                side_effect=(("77D2A8", 0.9), ("77DZA8", 0.9)),
+            ),
+        ):
+            self.assertEqual(recognize_captcha(b"image"), "77D2A8")
+
+    def test_transparent_image_is_composited_on_white(self):
+        """透明图片必须先铺白底，避免透明像素被误当成黑色字符。"""
+
+        image = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        gray = load_grayscale_image(buffer.getvalue())
+
+        self.assertTrue((gray == 255).all())
+
+    def test_invalid_image_content_is_rejected(self):
+        """可解码 Base64 中的非图片内容必须返回图片格式错误。"""
+
+        with self.assertRaisesRegex(InvalidImageError, "not a supported image"):
+            load_grayscale_image(b"not-an-image")
+
+    def test_oversized_image_dimensions_are_rejected(self):
+        """高压缩率图片也必须执行像素尺寸限制，防止解压炸弹。"""
+
+        image = Image.new("RGB", (4097, 1), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        with self.assertRaisesRegex(ImageTooLargeError, "4096 x 4096"):
+            load_grayscale_image(buffer.getvalue())
 
 
 if __name__ == "__main__":
